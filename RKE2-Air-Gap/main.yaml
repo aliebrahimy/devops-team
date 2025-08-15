@@ -1,0 +1,240 @@
+---
+- name: Parse Survey vars and build dynamic inventory
+  hosts: localhost
+  gather_facts: false
+  vars:
+    master_nodes: "{{ master_nodes | default('') }}"
+    worker_nodes: "{{ worker_nodes | default('') }}"
+    rke2_artifacts: "{{ rke2_artifacts | default('') }}"
+    cni_type: "{{ cni_type | default('cilium') }}"
+  tasks:
+    - name: Normalize masters/workers/artifacts into lists
+      set_fact:
+        masters_list: "{{ master_nodes.splitlines() | map('trim') | reject('equalto','') | list }}"
+        workers_list: "{{ worker_nodes.splitlines() | map('trim') | reject('equalto','') | list }}"
+        artifacts_list: "{{ rke2_artifacts.splitlines() | map('trim') | reject('equalto','') | list }}"
+
+    - name: Fail if no masters provided
+      fail:
+        msg: "حداقل یک IP برای master_nodes لازم است"
+      when: masters_list | length == 0
+
+    - name: Register primary master
+      set_fact:
+        primary_master: "{{ masters_list[0] }}"
+
+    - name: Add primary master
+      add_host:
+        name: "{{ primary_master }}"
+        groups: rke2_primary,rke2_masters,all_rke2
+
+    - name: Add remaining masters
+      add_host:
+        name: "{{ item }}"
+        groups: rke2_masters,all_rke2
+      loop: "{{ masters_list[1:] }}"
+
+    - name: Add workers
+      add_host:
+        name: "{{ item }}"
+        groups: rke2_workers,all_rke2
+      loop: "{{ workers_list }}"
+
+    - name: Share vars
+      set_fact:
+        cni_choice: "{{ cni_type | lower }}"
+        shared_artifacts: "{{ artifacts_list }}"
+
+- name: Common OS prep on all nodes
+  hosts: all_rke2
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Ensure basic packages
+      package:
+        name: [curl, tar, iptables, conntrack-tools, socat, ebtables, ethtool]
+        state: present
+
+    - name: Disable swap immediately
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+
+    - name: Remove swap entries from /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\\sswap\\s)'
+        replace: '# \\1'
+
+    - name: Kernel modules for k8s
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          br_netfilter
+          overlay
+
+    - name: Sysctl settings for k8s
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+      notify: Reload sysctl
+
+    - name: Create artifact dirs
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /root/rke2-artifacts
+        - /etc/rancher/rke2
+        - /var/lib/rancher/rke2/agent/images
+
+    - name: Download RKE2 artifacts (from node itself)
+      shell: |
+        set -euo pipefail
+        cd /root/rke2-artifacts
+        url="{{ item }}"
+        fname="$(basename "$url")"
+        if [ ! -s "$fname" ]; then
+          curl -fL --retry 3 -O "$url"
+        fi
+      args: { executable: /bin/bash }
+      loop: "{{ hostvars['localhost'].shared_artifacts }}"
+
+    - name: Download RKE2 install script
+      shell: |
+        set -euo pipefail
+        cd /root/rke2-artifacts
+        if [ ! -s install.sh ]; then
+          curl -sfL https://get.rke2.io --output install.sh
+          chmod +x install.sh
+        fi
+      args: { executable: /bin/bash }
+
+    - name: Move core + selected CNI image tarballs into images dir
+      shell: |
+        set -euo pipefail
+        shopt -s nullglob
+        cd /root/rke2-artifacts
+        for f in rke2-images-core.*.tar.gz; do mv -f "$f" /var/lib/rancher/rke2/agent/images/; done
+        if [ "{{ hostvars['localhost'].cni_choice }}" = "cilium" ]; then
+          for f in rke2-images-cilium.*.tar.gz; do mv -f "$f" /var/lib/rancher/rke2/agent/images/; done
+        else
+          for f in rke2-images-calico.*.tar.gz; do mv -f "$f" /var/lib/rancher/rke2/agent/images/; done
+        fi
+      args: { executable: /bin/bash }
+
+    - name: Install RKE2 using INSTALL_RKE2_ARTIFACT_PATH
+      shell: |
+        set -euo pipefail
+        INSTALL_RKE2_ARTIFACT_PATH=/root/rke2-artifacts sh /root/rke2-artifacts/install.sh
+      args: { executable: /bin/bash }
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
+
+- name: Bootstrap primary master (init cluster & CNI via RKE2 bundles)
+  hosts: rke2_primary
+  become: true
+  gather_facts: true
+  vars:
+    node_ip: "{{ ansible_default_ipv4.address }}"
+  tasks:
+    - name: Render /etc/rancher/rke2/config.yaml (primary)
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        mode: '0600'
+        content: |
+          cni: {{ hostvars['localhost'].cni_choice }}
+          node-ip: {{ node_ip }}
+          # tls-san:
+          #   - {{ inventory_hostname }}
+
+    - name: Enable & start rke2-server
+      systemd: { name: rke2-server, enabled: true, state: started, daemon_reload: true }
+
+    - name: Wait for kubeconfig
+      wait_for: { path: /etc/rancher/rke2/rke2.yaml, timeout: 900 }
+
+    - name: Capture cluster token
+      slurp: { src: /var/lib/rancher/rke2/server/node-token }
+      register: node_token
+
+    - name: Share token and server URL
+      set_fact:
+        rke2_cluster_token: "{{ node_token.content | b64decode | trim }}"
+        rke2_server_url: "https://{{ ansible_default_ipv4.address }}:9345"
+
+    - name: Export PATH and kubeconfig for root
+      block:
+        - lineinfile:
+            path: /root/.bashrc
+            line: 'PATH=$PATH:/var/lib/rancher/rke2/bin'
+            create: yes
+            state: present
+        - shell: |
+            set -euo pipefail
+            mkdir -p /root/.kube
+            cp /etc/rancher/rke2/rke2.yaml /root/.kube/config
+          args: { executable: /bin/bash }
+
+- name: Join remaining masters as servers
+  hosts: rke2_masters:!rke2_primary
+  become: true
+  gather_facts: true
+  vars:
+    join_server: "{{ hostvars[groups['rke2_primary'][0]].rke2_server_url }}"
+    join_token:  "{{ hostvars[groups['rke2_primary'][0]].rke2_cluster_token }}"
+  tasks:
+    - name: Render /etc/rancher/rke2/config.yaml (server join)
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        mode: '0600'
+        content: |
+          server: {{ join_server }}
+          token: {{ join_token }}
+          cni: {{ hostvars['localhost'].cni_choice }}
+          node-ip: {{ ansible_default_ipv4.address }}
+
+    - name: Enable & start rke2-server
+      systemd: { name: rke2-server, enabled: true, state: started, daemon_reload: true }
+
+- name: Join workers as agents
+  hosts: rke2_workers
+  become: true
+  gather_facts: true
+  vars:
+    join_server: "{{ hostvars[groups['rke2_primary'][0]].rke2_server_url }}"
+    join_token:  "{{ hostvars[groups['rke2_primary'][0]].rke2_cluster_token }}"
+  tasks:
+    - name: Render /etc/rancher/rke2/config.yaml (agent join)
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        mode: '0600'
+        content: |
+          server: {{ join_server }}
+          token: {{ join_token }}
+          cni: {{ hostvars['localhost'].cni_choice }}
+          node-ip: {{ ansible_default_ipv4.address }}
+
+    - name: Enable & start rke2-agent
+      systemd: { name: rke2-agent, enabled: true, state: started, daemon_reload: true }
+
+- name: Quick validation from primary
+  hosts: rke2_primary
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  tasks:
+    - name: Wait nodes Ready (10m)
+      shell: /var/lib/rancher/rke2/bin/kubectl wait node --all --for=condition=Ready --timeout=10m
+      args: { executable: /bin/bash }
+
+    - name: Show nodes
+      command: /var/lib/rancher/rke2/bin/kubectl get nodes -o wide
+      register: nodes
+    - debug: { var: nodes.stdout_lines }
