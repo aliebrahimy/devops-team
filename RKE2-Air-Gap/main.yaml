@@ -103,16 +103,12 @@
       args: { executable: /bin/bash }
       loop: "{{ hostvars['localhost'].shared_artifacts }}"
 
-    - name: Download RKE2 install script
-      shell: |
-        set -euo pipefail
-        cd /root/rke2-artifacts
-        if [ ! -s install.sh ]; then
-          curl -sfL https://get.rke2.io --output install.sh
-          chmod +x install.sh
-        fi
-      args: { executable: /bin/bash }
-
+    - name: Copy RKE2 install script from local files
+      copy:
+        src: files/install.sh
+        dest: /root/rke2-artifacts/install.sh
+        mode: '0755'
+        
     - name: Move core + selected CNI image tarballs into images dir
       shell: |
         set -euo pipefail
