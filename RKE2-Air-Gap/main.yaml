@@ -91,6 +91,23 @@
         - /etc/rancher/rke2
         - /var/lib/rancher/rke2/agent/images
 
+    # ------------------ Embedded Registry Mirror Settings ------------------
+#    - name: Enable embedded registry mirror in RKE2 config
+#      blockinfile:
+#        path: /etc/rancher/rke2/config.yaml
+#        create: yes
+#        block: |
+#          embedded-registry: true
+#          supervisor-metrics: true
+#
+#    - name: Configure registries.yaml for embedded mirror
+#      copy:
+#        dest: /etc/rancher/rke2/registries.yaml
+#        content: |
+#          mirrors:
+#            "*":
+    # ------------------------------------------------------------------------
+
     - name: Download RKE2 artifacts (from node itself)
       shell: |
         set -euo pipefail
@@ -108,7 +125,7 @@
         src: files/install.sh
         dest: /root/rke2-artifacts/install.sh
         mode: '0755'
-        
+
     - name: Move core + selected CNI image tarballs into images dir
       shell: |
         set -euo pipefail
@@ -148,6 +165,18 @@
           node-ip: {{ node_ip }}
           # tls-san:
           #   - {{ inventory_hostname }}
+  
+    - name: Configure Cilium HelmChartConfig
+      template:
+        src: rke2-cilium-config.yaml.j2
+        dest: /var/lib/rancher/rke2/server/manifests/rke2-cilium-config.yaml
+      when: cni_type | lower == "cilium"
+
+    - name: Configure Calico HelmChartConfig
+      template:
+        src: rke2-calico-config.yaml.j2
+        dest: /var/lib/rancher/rke2/server/manifests/rke2-calico-config.yaml
+      when: cni_type | lower == "calico"
 
     - name: Enable & start rke2-server
       systemd: { name: rke2-server, enabled: true, state: started, daemon_reload: true }
@@ -176,6 +205,38 @@
             mkdir -p /root/.kube
             cp /etc/rancher/rke2/rke2.yaml /root/.kube/config
           args: { executable: /bin/bash }
+
+    - name: Install Gateway API CRDs for Cilium
+      block:
+        - name: Create /opt/cilium directory
+          file:
+            path: /opt/cilium
+            state: directory
+            mode: '0755'
+
+        - name: Copy Gateway API CRD files from local files/
+          copy:
+            src: "files/{{ item }}"
+            dest: "/opt/cilium/{{ item }}"
+            mode: '0644'
+          loop:
+            - gateway.networking.k8s.io_gatewayclasses.yaml
+            - gateway.networking.k8s.io_gateways.yaml
+            - gateway.networking.k8s.io_httproutes.yaml
+            - gateway.networking.k8s.io_referencegrants.yaml
+            - gateway.networking.k8s.io_grpcroutes.yaml
+            - gateway.networking.k8s.io_tlsroutes.yaml
+
+        - name: Apply Gateway API CRDs
+          command: "/var/lib/rancher/rke2/bin/kubectl apply -f /opt/cilium/{{ item }}"
+          loop:
+            - gateway.networking.k8s.io_gatewayclasses.yaml
+            - gateway.networking.k8s.io_gateways.yaml
+            - gateway.networking.k8s.io_httproutes.yaml
+            - gateway.networking.k8s.io_referencegrants.yaml
+            - gateway.networking.k8s.io_grpcroutes.yaml
+            - gateway.networking.k8s.io_tlsroutes.yaml
+      when: hostvars['localhost'].cni_choice == "cilium"
 
 - name: Join remaining masters as servers
   hosts: rke2_masters:!rke2_primary
