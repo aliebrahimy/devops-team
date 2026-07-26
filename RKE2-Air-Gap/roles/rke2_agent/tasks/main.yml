@@ -1,0 +1,29 @@
+---
+- name: Determine Server URL for Worker Join
+  ansible.builtin.set_fact:
+    rke2_server_url: "{{ 'https://' + hostvars['localhost']['lb_vip'] + ':9345' if hostvars['localhost']['enable_load_balancer'] | default(false) | bool else 'https://' + hostvars['localhost']['first_master_ip'] + ':9345' }}"
+
+- name: Create RKE2 agent config.yaml
+  ansible.builtin.copy:
+    dest: "{{ rke2_config_dir }}/config.yaml"
+    content: |
+      server: "{{ rke2_server_url }}"
+      token: "{{ hostvars[groups['first_master'][0]]['rke2_shared_token'] }}"
+      node-ip: "{{ ansible_default_ipv4.address }}"
+      node-name: "{{ inventory_hostname }}"
+      # محدودیت سایز لاگ کانتینرها بر اساس داکیومنت شما
+      containerd-log-max-size: "40Mi"
+      containerd-log-max-files: 30
+    mode: '0600'
+
+- name: Install RKE2 agent binary offline
+  ansible.builtin.shell:
+    cmd: INSTALL_RKE2_ARTIFACT_PATH={{ rke2_artifact_dest }} sh {{ rke2_artifact_dest }}/install.sh
+  environment:
+    INSTALL_RKE2_TYPE: "agent"
+
+- name: Start and Enable RKE2 agent service
+  ansible.builtin.systemd:
+    name: rke2-agent
+    state: started
+    enabled: true

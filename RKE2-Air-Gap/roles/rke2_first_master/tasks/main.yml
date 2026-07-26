@@ -1,0 +1,52 @@
+---
+- name: Create RKE2 config.yaml for first master
+  ansible.builtin.copy:
+    dest: "{{ rke2_config_dir }}/config.yaml"
+    content: |
+      write-kubeconfig-mode: "0644"
+      tls-san:
+        - "{{ ansible_default_ipv4.address }}"
+        {% if hostvars['localhost']['enable_load_balancer'] | default(false) | bool %}
+        - "{{ hostvars['localhost']['lb_vip'] }}"
+        - "{{ hostvars['localhost']['lb_dns_name'] | default(hostvars['localhost']['lb_vip']) }}"
+        {% endif %}
+      cni: "{{ hostvars['localhost']['cni_type'] }}"
+      {% if hostvars['localhost']['cni_type'] == 'cilium' %}
+      disable:
+        - rke2-canal
+        - rke2-kube-proxy
+      disable-kube-proxy: true
+      {% endif %}
+      cluster-cidr: "{{ cluster_cidr }}"
+      service-cidr: "{{ service_cidr }}"
+      node-ip: "{{ ansible_default_ipv4.address }}"
+      node-name: "{{ inventory_hostname }}"
+    mode: '0600'
+
+- name: Install RKE2 server binary offline
+  ansible.builtin.shell:
+    cmd: INSTALL_RKE2_ARTIFACT_PATH={{ rke2_artifact_dest }} sh {{ rke2_artifact_dest }}/install.sh
+  environment:
+    INSTALL_RKE2_TYPE: "server"
+
+- name: Start and Enable RKE2 server service
+  ansible.builtin.systemd:
+    name: rke2-server
+    state: started
+    enabled: true
+
+- name: Wait for API Server to respond (port 6443)
+  ansible.builtin.wait_for:
+    port: "{{ rke2_api_port }}"
+    delay: 15
+    timeout: 300
+
+- name: Retrieve node token from first master
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/rke2/server/node-token
+  register: node_token_b64
+
+- name: Set token fact globally
+  ansible.builtin.set_fact:
+    rke2_shared_token: "{{ node_token_b64['content'] | b64decode | trim }}"
+    cacheable: true

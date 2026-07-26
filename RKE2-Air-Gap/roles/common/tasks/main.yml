@@ -1,0 +1,28 @@
+---
+- name: Create directories for RKE2 artifacts and configs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ rke2_artifact_dest }}"
+    - "{{ rke2_config_dir }}"
+    - "{{ rke2_images_dir }}"
+
+- name: Copy RKE2 offline artifacts from AWX to Node
+  ansible.builtin.copy:
+    src: "files/rke2-artifacts/{{ hostvars['localhost']['rke2_version'] }}/{{ item }}"
+    dest: "{{ rke2_artifact_dest }}/{{ item }}"
+    mode: '0755'
+  loop:
+    - rke2.linux-amd64.tar.gz
+    - rke2-images.linux-amd64.tar.zst
+    - sha256sum-amd64.txt
+    - install.sh
+
+- name: Place offline images tarball in agent directory
+  ansible.builtin.copy:
+    src: "{{ rke2_artifact_dest }}/rke2-images.linux-amd64.tar.zst"
+    dest: "{{ rke2_images_dir }}/rke2-images.linux-amd64.tar.zst"
+    remote_src: true
+    mode: '0644'

@@ -1,0 +1,25 @@
+---
+- name: Install Keepalived (Offline Package)
+  ansible.builtin.package:
+    name: keepalived
+    state: present
+
+- name: Configure Keepalived for LB1 (Master)
+  ansible.builtin.template:
+    src: files/lb/keepalived-master.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: '0644'
+  when: inventory_hostname == hostvars['localhost']['lb1_ip'].strip()
+
+- name: Configure Keepalived for LB2 (Backup)
+  ansible.builtin.template:
+    src: files/lb/keepalived-backup.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: '0644'
+  when: inventory_hostname == hostvars['localhost']['lb2_ip'].strip()
+
+- name: Enable and restart Keepalived service
+  ansible.builtin.systemd:
+    name: keepalived
+    state: restarted
+    enabled: true
