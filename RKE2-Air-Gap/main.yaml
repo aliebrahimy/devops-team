@@ -12,45 +12,121 @@
     rke2_api_port: 6443
     rke2_register_port: 9345
 
-    # تنظیمات پیش‌فرض شبکه کلاستر (بر اساس سند)
+    # تنظیمات پیش‌فرض شبکه کلاستر
     cluster_cidr: "10.42.0.0/16"
     service_cidr: "10.43.0.0/16"
+
   tasks:
-    - name: Add First Master Node
-      ansible.builtin.add_host:
-        name: "{{ first_master_ip.strip() }}"
-        groups: first_master
-        ansible_user: root
+    - name: Normalize additional masters list
+      ansible.builtin.set_fact:
+        additional_master_list: >-
+          {{
+            additional_masters_ips.split(',')
+            | map('trim')
+            | reject('equalto', '')
+            | list
+            if (additional_masters_ips is defined and additional_masters_ips | trim | length > 0)
+            else []
+          }}
 
-    - name: Add Additional Master Nodes
-      ansible.builtin.add_host:
-        name: "{{ item.strip() }}"
-        groups: additional_masters
-        ansible_user: root
-      loop: "{{ additional_masters_ips.split(',') }}"
-      when: additional_masters_ips is defined and additional_masters_ips | trim | length > 0
+    - name: Normalize worker list
+      ansible.builtin.set_fact:
+        worker_list: >-
+          {{
+            worker_ips.split(',')
+            | map('trim')
+            | reject('equalto', '')
+            | list
+            if (worker_ips is defined and worker_ips | trim | length > 0)
+            else []
+          }}
 
-    - name: Add Worker Nodes
-      ansible.builtin.add_host:
-        name: "{{ item.strip() }}"
-        groups: workers
-        ansible_user: root
-      loop: "{{ worker_ips.split(',') }}"
-      when: worker_ips is defined and worker_ips | trim | length > 0
+    - name: Calculate master count
+      ansible.builtin.set_fact:
+        master_count: "{{ 1 + (additional_master_list | length) }}"
 
-    - name: Add Load Balancers (if enabled)
+    - name: Validate master count
+      ansible.builtin.assert:
+        that:
+          - first_master_ip is defined
+          - first_master_ip | trim | length > 0
+          - master_count | int == 1 or (master_count | int % 2 == 1)
+        fail_msg: >-
+          Invalid master count: the number of master nodes must be 1 or an odd number.
+          Use 1 for single-master or 3/5/... for HA clusters.
+        success_msg: "Master count is valid: {{ master_count }}"
+
+    - name: Add first master node as master1
       ansible.builtin.add_host:
-        name: "{{ item.strip() }}"
-        groups: load_balancers
+        name: "master1"
+        groups:
+          - first_master
+          - masters
+          - kube_cluster
+        ansible_host: "{{ first_master_ip | trim }}"
         ansible_user: root
+        node_role: "master"
+        node_index: 1
+
+    - name: Add additional master nodes as master2..masterN
+      ansible.builtin.add_host:
+        name: "master{{ idx + 2 }}"
+        groups:
+          - additional_masters
+          - masters
+          - kube_cluster
+        ansible_host: "{{ item }}"
+        ansible_user: root
+        node_role: "master"
+        node_index: "{{ idx + 2 }}"
+      loop: "{{ additional_master_list }}"
+      loop_control:
+        index_var: idx
+
+    - name: Add worker nodes as worker1..workerN
+      ansible.builtin.add_host:
+        name: "worker{{ idx + 1 }}"
+        groups:
+          - workers
+          - kube_cluster
+        ansible_host: "{{ item }}"
+        ansible_user: root
+        node_role: "worker"
+        node_index: "{{ idx + 1 }}"
+      loop: "{{ worker_list }}"
+      loop_control:
+        index_var: idx
+
+    - name: Validate load balancer inputs when enabled
+      ansible.builtin.assert:
+        that:
+          - lb1_ip is defined
+          - lb1_ip | trim | length > 0
+          - lb2_ip is defined
+          - lb2_ip | trim | length > 0
+        fail_msg: >-
+          Load balancer is enabled, but lb1_ip or lb2_ip is missing.
+      when: enable_load_balancer | default(false) | bool
+
+    - name: Add load balancer nodes when enabled
+      ansible.builtin.add_host:
+        name: "lb{{ idx + 1 }}"
+        groups:
+          - load_balancers
+        ansible_host: "{{ item }}"
+        ansible_user: root
+        node_role: "load_balancer"
+        node_index: "{{ idx + 1 }}"
       loop:
-        - "{{ lb1_ip.strip() }}"
-        - "{{ lb2_ip.strip() }}"
+        - "{{ lb1_ip | trim }}"
+        - "{{ lb2_ip | trim }}"
+      loop_control:
+        index_var: idx
       when: enable_load_balancer | default(false) | bool
 
 # گام ۲: اجرای پیش‌نیازها و انتقال آرتیفکت‌های آفلاین به تمام نودهای کلاستر
 - name: Prepare Offline Artifacts on Kubernetes Nodes
-  hosts: first_master:additional_masters:workers
+  hosts: masters:workers
   become: true
   gather_facts: true
   roles:
@@ -66,7 +142,7 @@
     - role: lb_nginx
   when: hostvars['localhost']['enable_load_balancer'] | default(false) | bool
 
-# گام ۴: راه‌اندازی اولین مستر (Bootstrap Node)
+# گام ۴: راه‌اندازی اولین مستر
 - name: Initialize First Master Node
   hosts: first_master
   become: true
@@ -90,4 +166,4 @@
   gather_facts: true
   roles:
     - role: rke2_agent
-  when: groups['workers'] is defined and groups['workers'] | length > 0      
+  when: groups['workers'] is defined and groups['workers'] | length > 0
