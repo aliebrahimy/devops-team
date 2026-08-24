@@ -9,6 +9,12 @@
     - "{{ rke2_config_dir }}"
     - "{{ rke2_images_dir }}"
 
+- name: Check if offline artifacts exist on controller (AWX)
+  ansible.builtin.stat:
+     path: "files/rke2-artifacts/{{ hostvars['localhost']['rke2_version'] }}/rke2.linux-amd64.tar.gz"
+  delegate_to: localhost
+  register: offline_artifact_check
+
 - name: Copy RKE2 offline artifacts from AWX to Node
   ansible.builtin.copy:
     src: "files/rke2-artifacts/{{ hostvars['localhost']['rke2_version'] }}/{{ item }}"
@@ -19,6 +25,23 @@
     - rke2-images.linux-amd64.tar.zst
     - sha256sum-amd64.txt
     - install.sh
+  when: offline_artifact_check.stat.exists
+
+- name: Download RKE2 artifacts directly from GitHub to Node
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ rke2_artifact_dest }}/{{ item.name }}"
+    mode: '0755'
+  loop:
+    - name: rke2.linux-amd64.tar.gz
+      url: "https://github.com/rancher/rke2/releases/download/{{ hostvars['localhost']['rke2_version'] }}/rke2.linux-amd64.tar.gz"
+    - name: rke2-images.linux-amd64.tar.zst
+      url: "https://github.com/rancher/rke2/releases/download/{{ hostvars['localhost']['rke2_version'] }}/rke2-images.linux-amd64.tar.zst"
+    - name: sha256sum-amd64.txt
+      url: "https://github.com/rancher/rke2/releases/download/{{ hostvars['localhost']['rke2_version'] }}/sha256sum-amd64.txt"
+    - name: install.sh
+      url: "https://get.rke2.io"
+  when: not offline_artifact_check.stat.exists
 
 - name: Place offline images tarball in agent directory
   ansible.builtin.copy:
